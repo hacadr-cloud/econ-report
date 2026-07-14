@@ -1,0 +1,66 @@
+name: Morning LINE econ report
+
+# Hybrid delivery: the PC builds the econ report in the evening and commits line-latest.txt
+# (+ line-date.txt) to this repo. This cron sends it to the owner on LINE at 07:00 JST,
+# so delivery does not depend on the PC being awake in the morning (same scheme as carrier-digest).
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # 22:00 UTC == 07:00 JST
+  workflow_dispatch: {}     # allow manual test runs
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Send econ report to LINE (owner)
+        env:
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          set -euo pipefail
+          if [ ! -f line-latest.txt ]; then
+            echo "line-latest.txt missing; nothing to send"; exit 0
+          fi
+          if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
+            echo "Secrets LINE_CHANNEL_TOKEN / LINE_USER_ID are not set"; exit 1
+          fi
+          # Staleness guard: only send if the report was built today or yesterday (JST),
+          # so a PC that was off for days does not blast an old report as if it were fresh.
+          today=$(TZ=Asia/Tokyo date +%F)
+          yday=$(TZ=Asia/Tokyo date -d 'yesterday' +%F)
+          d=$(cat line-date.txt 2>/dev/null || echo "")
+          if [ "$d" != "$today" ] && [ "$d" != "$yday" ]; then
+            echo "line-date='$d' is stale (today=$today); skipping send"; exit 0
+          fi
+          jq -Rs --arg to "$LINE_USER_ID" \
+            '{to:$to, messages:[{type:"text", text:.}]}' line-latest.txt > payload.json
+          code=$(curl -sS -o resp.json -w "%{http_code}" -X POST \
+            https://api.line.me/v2/bot/message/push \
+            -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data @payload.json)
+          echo "LINE push HTTP $code"; cat resp.json || true
+          test "$code" = "200"
+
+      - name: Alert owner on failure
+        if: failure()
+        env:
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          [ -z "${LINE_CHANNEL_TOKEN:-}" ] && exit 0
+          [ -z "${LINE_USER_ID:-}" ] && exit 0
+          jq -n --arg to "$LINE_USER_ID" \
+            --arg text "[LSM自動配信] 朝の日次経済レポート配信に失敗しました（GitHub Actions）。Runログを確認してください。" \
+            '{to:$to, messages:[{type:"text", text:$text}]}' > alert.json
+          curl -sS -X POST https://api.line.me/v2/bot/message/push \
+            -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data @alert.json || true
+          echo "failure alert sent to owner"
