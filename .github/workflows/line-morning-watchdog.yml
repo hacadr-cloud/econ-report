@@ -1,0 +1,64 @@
+name: Morning LINE econ watchdog
+
+# line-morning.yml is a cron job, and GitHub can silently delay or drop scheduled runs
+# (2026-07-15: the very first scheduled fire never happened, so nothing was delivered and
+# nothing failed loudly). Failure alerts only cover runs that START; this watchdog covers
+# the run that never starts. It alerts the owner when a report was staged for delivery but
+# no successful send happened today (JST).
+#
+# Mirror of carrier-digest's line-morning-watchdog.yml (same proven design); only the
+# schedule minute, wording and repo name differ.
+
+on:
+  schedule:
+    - cron: '46 23 * * *'   # 08:46 JST - well after the 07:18 JST send, off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Alert owner if this morning's econ report was never sent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: |
+          set -euo pipefail
+          today=$(TZ=Asia/Tokyo date +%F)
+          yday=$(TZ=Asia/Tokyo date -d 'yesterday' +%F)
+          d=$(cat line-date.txt 2>/dev/null || echo "")
+          # Same freshness rule as the sender: if nothing fresh was staged, no delivery was
+          # expected this morning and silence is correct - do not cry wolf.
+          if [ "$d" != "$today" ] && [ "$d" != "$yday" ]; then
+            echo "line-date='$d' not fresh (today=$today); no delivery expected"; exit 0
+          fi
+          # Was there a successful send since 00:00 JST today? Compare UTC ISO timestamps
+          # (lexicographic order == chronological order for this format). A UTC *date*
+          # filter would be wrong: the 07:18 JST send is created on the previous UTC day.
+          # NOTE: the offset must be spelled out. `TZ=Asia/Tokyo date -u -d "$today 00:00"`
+          # does NOT work: -u forces UTC for parsing too, so it yields UTC midnight (a
+          # future instant) and every run looks missing -> false alert.
+          since=$(date -u -d "$today 00:00 +0900" +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?per_page=30&status=success" \
+              | jq --arg since "$since" '[.workflow_runs[] | select(.created_at >= $since)] | length')
+          echo "successful sends since $since (JST midnight): $n"
+          if [ "$n" -gt 0 ]; then echo "delivered OK - no alert"; exit 0; fi
+
+          if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
+            echo "LINE secrets missing; cannot alert"; exit 1
+          fi
+          jq -n --arg to "$LINE_USER_ID" \
+            --arg text "[LSM自動配信] 朝の日次経済レポートが本日まだ配信されていません。GitHub Actions の schedule が発火しなかった可能性があります。手動送信: gh workflow run line-morning.yml --repo hacadr-cloud/econ-report" \
+            '{to:$to, messages:[{type:"text", text:$text}]}' > alert.json
+          curl -sS -X POST https://api.line.me/v2/bot/message/push \
+            -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data @alert.json
+          echo "missed-delivery alert sent to owner"

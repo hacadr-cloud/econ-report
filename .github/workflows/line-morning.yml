@@ -1,12 +1,16 @@
 name: Morning LINE econ report
 
 # Hybrid delivery: the PC builds the econ report in the evening and commits line-latest.txt
-# (+ line-date.txt) to this repo. This cron sends it to the owner on LINE at 07:00 JST,
-# so delivery does not depend on the PC being awake in the morning (same scheme as carrier-digest).
+# (+ line-date.txt) to this repo. This cron sends it to the owner on LINE in the morning,
+# so delivery does not depend on the PC being awake (same scheme as carrier-digest).
 
 on:
   schedule:
-    - cron: '0 22 * * *'   # 22:00 UTC == 07:00 JST
+    # 22:18 UTC == 07:18 JST. NOT on the hour: GitHub delays/drops scheduled runs most at
+    # the top of every hour (2026-07-15: the first '0 22' fire never happened at all, and
+    # nothing alerted because a run that never starts cannot fail). Offset 5 min from
+    # carrier-digest's 07:13 JST send so the two repos do not contend for the same slot.
+    - cron: '18 22 * * *'
   workflow_dispatch: {}     # allow manual test runs
 
 permissions:
