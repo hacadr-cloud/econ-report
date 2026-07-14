@@ -46,10 +46,21 @@ jobs:
           # does NOT work: -u forces UTC for parsing too, so it yields UTC midnight (a
           # future instant) and every run looks missing -> false alert.
           since=$(date -u -d "$today 00:00 +0900" +%Y-%m-%dT%H:%M:%SZ)
-          n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?per_page=30&status=success" \
-              | jq --arg since "$since" '[.workflow_runs[] | select(.created_at >= $since)] | length')
-          echo "successful sends since $since (JST midnight): $n"
-          if [ "$n" -gt 0 ]; then echo "delivered OK - no alert"; exit 0; fi
+          # Count actual DELIVERIES, not successful runs. The sender exits 0 when it skips
+          # (stale), so "run succeeded" does NOT mean "the report was sent" - counting runs
+          # made this report delivered OK for a send that never happened.
+          delivered=0
+          for rid in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?per_page=30&status=success" \
+                       | jq -r --arg since "$since" '.workflow_runs[] | select(.created_at >= $since) | .id'); do
+            # "LINE push HTTP 200" is accepted too: it is printed only after a real push
+            # returned 200, so runs from before the DELIVERED_OK marker still read correctly.
+            if gh run view "$rid" --repo "$GITHUB_REPOSITORY" --log 2>/dev/null \
+               | grep -qE "DELIVERED_OK|LINE push HTTP 200"; then
+              echo "run $rid delivered"; delivered=1; break
+            fi
+          done
+          echo "actual deliveries since $since (JST midnight): $delivered"
+          if [ "$delivered" -gt 0 ]; then echo "delivered OK - no alert"; exit 0; fi
 
           if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
             echo "LINE secrets missing; cannot alert"; exit 1
@@ -57,8 +68,15 @@ jobs:
           jq -n --arg to "$LINE_USER_ID" \
             --arg text "[LSM自動配信] 朝の日次経済レポートが本日まだ配信されていません。GitHub Actions の schedule が発火しなかった可能性があります。手動送信: gh workflow run line-morning.yml --repo hacadr-cloud/econ-report" \
             '{to:$to, messages:[{type:"text", text:$text}]}' > alert.json
-          curl -sS -X POST https://api.line.me/v2/bot/message/push \
+          code=$(curl -sS --connect-timeout 10 --max-time 30 -o aresp.json -w "%{http_code}" \
+            -X POST https://api.line.me/v2/bot/message/push \
             -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
             -H "Content-Type: application/json" \
-            --data @alert.json
-          echo "missed-delivery alert sent to owner"
+            --data @alert.json) || code="000"
+          cat aresp.json 2>/dev/null || true
+          if [ "$code" = "200" ]; then
+            echo "missed-delivery alert delivered to owner"
+          else
+            echo "::error::missed-delivery alert could NOT be delivered (LINE HTTP $code)"
+            exit 1
+          fi

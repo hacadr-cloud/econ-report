@@ -28,9 +28,6 @@ jobs:
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: |
           set -euo pipefail
-          if [ ! -f line-latest.txt ]; then
-            echo "line-latest.txt missing; nothing to send"; exit 0
-          fi
           if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
             echo "Secrets LINE_CHANNEL_TOKEN / LINE_USER_ID are not set"; exit 1
           fi
@@ -40,17 +37,42 @@ jobs:
           yday=$(TZ=Asia/Tokyo date -d 'yesterday' +%F)
           d=$(cat line-date.txt 2>/dev/null || echo "")
           if [ "$d" != "$today" ] && [ "$d" != "$yday" ]; then
-            echo "line-date='$d' is stale (today=$today); skipping send"; exit 0
+            echo "line-date='$d' is stale (today=$today); skipping send"
+            echo "NOT_DELIVERED reason=stale date=$d"
+            exit 0
           fi
+          # Fresh date but no payload = broken state, NOT "nothing to do". Exiting 0 here is
+          # what lets a non-delivery masquerade as a green run.
+          if [ ! -f line-latest.txt ]; then
+            echo "line-date='$d' is fresh but line-latest.txt is missing - inconsistent state"
+            exit 1
+          fi
+          # Hash date+content -> v4-shaped UUID. LINE's X-Line-Retry-Key makes the send
+          # idempotent server-side for 24h, so a late cron plus a CATCH-UP dispatch cannot
+          # double-post the same report.
+          full=$( { cat line-date.txt; cat line-latest.txt; } | sha256sum | cut -c1-32 )
+          sha=${full:0:12}
+          retry_key="${full:0:8}-${full:8:4}-4${full:13:3}-a${full:17:3}-${full:20:12}"
           jq -Rs --arg to "$LINE_USER_ID" \
             '{to:$to, messages:[{type:"text", text:.}]}' line-latest.txt > payload.json
-          code=$(curl -sS -o resp.json -w "%{http_code}" -X POST \
+          code=$(curl -sS --connect-timeout 10 --max-time 60 -o resp.json -w "%{http_code}" -X POST \
             https://api.line.me/v2/bot/message/push \
             -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
             -H "Content-Type: application/json" \
+            -H "X-Line-Retry-Key: $retry_key" \
             --data @payload.json)
           echo "LINE push HTTP $code"; cat resp.json || true
-          test "$code" = "200"
+          # 409 = "The retry key is already accepted": LINE suppressed a duplicate of THIS
+          # report. Already delivered, so not a failure (verified live 2026-07-15).
+          if [ "$code" != "200" ] && [ "$code" != "409" ]; then
+            exit 1
+          fi
+          if [ "$code" = "409" ]; then
+            echo "LINE deduplicated a duplicate send (retry key already accepted)"
+          fi
+          # Machine-readable receipt: the watchdog must grep THIS, not the run conclusion,
+          # because a skipped run is also "success".
+          echo "DELIVERED_OK sha=$sha date=$d"
 
       - name: Alert owner on failure
         if: failure()
@@ -63,8 +85,16 @@ jobs:
           jq -n --arg to "$LINE_USER_ID" \
             --arg text "[LSM自動配信] 朝の日次経済レポート配信に失敗しました（GitHub Actions）。Runログを確認してください。" \
             '{to:$to, messages:[{type:"text", text:$text}]}' > alert.json
-          curl -sS -X POST https://api.line.me/v2/bot/message/push \
+          # Check the HTTP status: `curl ... || true` exits 0 on 401/429/500, so the old
+          # version printed "alert sent" even when the owner was never actually notified.
+          code=$(curl -sS --connect-timeout 10 --max-time 30 -o aresp.json -w "%{http_code}" \
+            -X POST https://api.line.me/v2/bot/message/push \
             -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
             -H "Content-Type: application/json" \
-            --data @alert.json || true
-          echo "failure alert sent to owner"
+            --data @alert.json) || code="000"
+          cat aresp.json 2>/dev/null || true
+          if [ "$code" = "200" ]; then
+            echo "failure alert delivered to owner"
+          else
+            echo "::error::failure alert could NOT be delivered (LINE HTTP $code) - owner was NOT notified"
+          fi
