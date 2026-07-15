@@ -6,11 +6,17 @@ name: Morning LINE econ report
 
 on:
   schedule:
-    # 22:18 UTC == 07:18 JST. NOT on the hour: GitHub delays/drops scheduled runs most at
-    # the top of every hour (2026-07-15: the first '0 22' fire never happened at all, and
-    # nothing alerted because a run that never starts cannot fail). Offset 5 min from
-    # carrier-digest's 07:13 JST send so the two repos do not contend for the same slot.
-    - cron: '18 22 * * *'
+    # 20:33 UTC == 05:33 JST (owner asked for ~05:30; econ is a personal delivery, so the
+    # early hour affects nobody else. carrier-digest stays at 07:13 JST: it goes to the
+    # employee LINE group).
+    # NOT on the hour: GitHub delays/drops scheduled runs most at the top of every hour
+    # (2026-07-15: the first '0 22' fire never happened at all, and nothing alerted because
+    # a run that never starts cannot fail).
+    # MUST stay later than report-deliver.ps1's NORMAL/CATCH-UP boundary (hour 5). NORMAL
+    # (=[16:00,05:00)) pushes and relies on THIS cron to send; if the send ran before that
+    # window closed, anything generated in the gap would be pushed and never sent. Moving
+    # this time means moving that boundary too - they are one design, not two settings.
+    - cron: '33 20 * * *'
   workflow_dispatch: {}     # allow manual test runs
 
 permissions:

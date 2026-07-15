@@ -11,7 +11,10 @@ name: Morning LINE econ watchdog
 
 on:
   schedule:
-    - cron: '46 23 * * *'   # 08:46 JST - well after the 07:18 JST send, off the hour
+    # 08:46 JST - deliberately ~3h after the 05:33 JST send, off the hour. Do NOT move this
+    # right up against the send: GitHub routinely delays scheduled runs by 30-60min, and a
+    # watchdog that fires while the send is merely late reports a false non-delivery.
+    - cron: '46 23 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -41,7 +44,7 @@ jobs:
           fi
           # Was there a successful send since 00:00 JST today? Compare UTC ISO timestamps
           # (lexicographic order == chronological order for this format). A UTC *date*
-          # filter would be wrong: the 07:18 JST send is created on the previous UTC day.
+          # filter would be wrong: the 05:33 JST send is created on the previous UTC day.
           # NOTE: the offset must be spelled out. `TZ=Asia/Tokyo date -u -d "$today 00:00"`
           # does NOT work: -u forces UTC for parsing too, so it yields UTC midnight (a
           # future instant) and every run looks missing -> false alert.
