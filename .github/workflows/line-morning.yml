@@ -1,23 +1,22 @@
 name: Morning LINE econ report
 
-# Hybrid delivery: the PC builds the econ report in the evening and commits line-latest.txt
-# (+ line-date.txt) to this repo. This cron sends it to the owner on LINE in the morning,
-# so delivery does not depend on the PC being awake (same scheme as carrier-digest).
+# The PC builds the econ report and commits line-latest.txt (+ line-date.txt) to this repo.
+# Sending is triggered externally (workflow_dispatch) -- see the note below.
+#
+# SCHEDULE REMOVED 2026-07-16 (owner's call). The '33 20' (05:33 JST) cron never fired --
+# not once, and the same was true of carrier-digest's. Both times were deliberately kept
+# off the hour to dodge GitHub's top-of-hour congestion, and it made no difference. A
+# schedule that never starts cannot fail, so nothing alerts -- the exact silent
+# non-delivery this pipeline exists to prevent. Do NOT restore a schedule here expecting
+# it to work; the replacement trigger is still to be decided.
+#
+# NOTE: report-deliver.ps1's NORMAL window ([16:00,05:00)) still pushes and assumes
+# something else sends afterwards. With no cron, NORMAL currently pushes and nothing
+# sends. That gap is intentional-for-now and must be closed by whatever trigger replaces
+# this -- the send time and that boundary are one design, not two settings.
 
 on:
-  schedule:
-    # 20:33 UTC == 05:33 JST (owner asked for ~05:30; econ is a personal delivery, so the
-    # early hour affects nobody else. carrier-digest stays at 07:13 JST: it goes to the
-    # employee LINE group).
-    # NOT on the hour: GitHub delays/drops scheduled runs most at the top of every hour
-    # (2026-07-15: the first '0 22' fire never happened at all, and nothing alerted because
-    # a run that never starts cannot fail).
-    # MUST stay later than report-deliver.ps1's NORMAL/CATCH-UP boundary (hour 5). NORMAL
-    # (=[16:00,05:00)) pushes and relies on THIS cron to send; if the send ran before that
-    # window closed, anything generated in the gap would be pushed and never sent. Moving
-    # this time means moving that boundary too - they are one design, not two settings.
-    - cron: '33 20 * * *'
-  workflow_dispatch: {}     # allow manual test runs
+  workflow_dispatch: {}     # the only trigger: PC-side scripts / manual runs
 
 permissions:
   contents: read
