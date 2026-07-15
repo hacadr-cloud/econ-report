@@ -3,42 +3,70 @@ name: Morning LINE econ watchdog
 # line-morning.yml is a cron job, and GitHub can silently delay or drop scheduled runs
 # (2026-07-15: the very first scheduled fire never happened, so nothing was delivered and
 # nothing failed loudly). Failure alerts only cover runs that START; this watchdog covers
-# the run that never starts. It alerts the owner when a report was staged for delivery but
-# no successful send happened today (JST).
+# the run that never starts.
+#
+# It does not just report the miss - it REPAIRS it: if no delivery happened today, it
+# dispatches line-morning.yml itself, waits, and verifies the receipt. Reporting alone still
+# leaves the owner without a report until they read the alert and type a command; the
+# failure this guards against (schedule silence) is mechanical, so repair it mechanically.
+#
+# Why dispatch instead of sending inline: the sender owns the freshness guard, the sha, the
+# X-Line-Retry-Key and the receipt. Re-implementing those here would duplicate logic that
+# must stay identical, and duplicated logic drifts. workflow_dispatch is an API call, not a
+# schedule, so it still works when the schedule infrastructure is exactly what is broken.
 #
 # Mirror of carrier-digest's line-morning-watchdog.yml (same proven design); only the
-# schedule minute, wording and repo name differ.
+# schedule minute, wording, destination and repo name differ.
 
 on:
   schedule:
     # 08:46 JST - deliberately ~3h after the 05:33 JST send, off the hour. Do NOT move this
     # right up against the send: GitHub routinely delays scheduled runs by 30-60min, and a
-    # watchdog that fires while the send is merely late reports a false non-delivery.
+    # watchdog that fires while the send is merely late reports a false non-delivery (and,
+    # now that it self-heals, would also dispatch a redundant send).
     - cron: '46 23 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would happen without dispatching a send or notifying'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  actions: read
+  # write (not read): needed to dispatch line-morning.yml for self-healing. The repo default
+  # is restricted to read, but a workflow may raise it - "Anyone with write access to a
+  # repository can modify the permissions granted to the GITHUB_TOKEN, adding or removing
+  # access as required, by editing the permissions key in the workflow file." Verified on
+  # carrier-digest: the Set up job log reported "Actions: write" despite the read default.
+  # Use dry_run=true to reproduce that log here without sending anything - a 403 would
+  # otherwise only surface during a real outage, the one moment self-healing has to work.
+  actions: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20   # bounds `gh run watch` if the send queues behind a late cron run
     steps:
       - uses: actions/checkout@v4
 
-      - name: Alert owner if this morning's econ report was never sent
+      - name: Verify this morning's delivery, self-heal if missing, alert if unrecoverable
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          # schedule events carry no inputs, so this resolves to false for the real run.
+          DRY_RUN: ${{ inputs.dry_run || false }}
         run: |
           set -euo pipefail
+          dry="${DRY_RUN:-false}"
+          echo "dry_run=$dry"
           today=$(TZ=Asia/Tokyo date +%F)
           yday=$(TZ=Asia/Tokyo date -d 'yesterday' +%F)
           d=$(cat line-date.txt 2>/dev/null || echo "")
           # Same freshness rule as the sender: if nothing fresh was staged, no delivery was
-          # expected this morning and silence is correct - do not cry wolf.
+          # expected this morning and silence is correct - do not cry wolf, and do NOT
+          # self-heal (re-sending a stale report is worse than sending nothing).
           if [ "$d" != "$today" ] && [ "$d" != "$yday" ]; then
             echo "line-date='$d' not fresh (today=$today); no delivery expected"; exit 0
           fi
@@ -49,37 +77,86 @@ jobs:
           # does NOT work: -u forces UTC for parsing too, so it yields UTC midnight (a
           # future instant) and every run looks missing -> false alert.
           since=$(date -u -d "$today 00:00 +0900" +%Y-%m-%dT%H:%M:%SZ)
-          # Count actual DELIVERIES, not successful runs. The sender exits 0 when it skips
-          # (stale), so "run succeeded" does NOT mean "the report was sent" - counting runs
-          # made this report delivered OK for a send that never happened.
-          delivered=0
-          for rid in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?per_page=30&status=success" \
-                       | jq -r --arg since "$since" '.workflow_runs[] | select(.created_at >= $since) | .id'); do
-            # "LINE push HTTP 200" is accepted too: it is printed only after a real push
-            # returned 200, so runs from before the DELIVERED_OK marker still read correctly.
-            if gh run view "$rid" --repo "$GITHUB_REPOSITORY" --log 2>/dev/null \
-               | grep -qE "DELIVERED_OK|LINE push HTTP 200"; then
-              echo "run $rid delivered"; delivered=1; break
-            fi
-          done
-          echo "actual deliveries since $since (JST midnight): $delivered"
-          if [ "$delivered" -gt 0 ]; then echo "delivered OK - no alert"; exit 0; fi
 
-          if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
-            echo "LINE secrets missing; cannot alert"; exit 1
+          # Count actual DELIVERIES, not successful runs. The sender exits 0 when it skips
+          # (stale / already-delivered), so "run succeeded" does NOT mean "the report was
+          # sent". Match only an EXECUTED receipt: Actions echoes the whole run: script into
+          # the log under ##[group]Run, so the unexecuted source line
+          # `echo "DELIVERED_OK sha=$sha date=$d"` appears in EVERY run - including one that
+          # skipped without sending. Requiring the expanded 12-hex sha excludes the literal
+          # source (which reads `sha=$sha`). "LINE push HTTP 200" is accepted for runs
+          # predating the receipt marker; it is source-safe too (source reads `HTTP $code`).
+          was_delivered() {
+            local rid
+            for rid in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?per_page=30&status=success" \
+                         | jq -r --arg since "$since" '.workflow_runs[] | select(.created_at >= $since) | .id'); do
+              if gh run view "$rid" --repo "$GITHUB_REPOSITORY" --log 2>/dev/null \
+                 | grep -qE "DELIVERED_OK sha=[0-9a-f]{12}|LINE push HTTP 200"; then
+                echo "run $rid carries a real delivery receipt"; return 0
+              fi
+            done
+            return 1
+          }
+
+          # Check the HTTP status: `curl ... || true` exits 0 on 401/429/500, which would
+          # print "notified" while the owner heard nothing.
+          notify() {
+            if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
+              echo "::error::LINE secrets missing; cannot notify owner"; return 1
+            fi
+            jq -n --arg to "$LINE_USER_ID" --arg text "$1" \
+              '{to:$to, messages:[{type:"text", text:$text}]}' > notify.json
+            local code
+            code=$(curl -sS --connect-timeout 10 --max-time 30 -o nresp.json -w "%{http_code}" \
+              -X POST https://api.line.me/v2/bot/message/push \
+              -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data @notify.json) || code="000"
+            cat nresp.json 2>/dev/null || true
+            if [ "$code" = "200" ]; then echo "owner notified"; return 0; fi
+            echo "::error::owner notification FAILED (LINE HTTP $code)"; return 1
+          }
+
+          if was_delivered; then
+            echo "delivered OK - nothing to repair"; exit 0
           fi
-          jq -n --arg to "$LINE_USER_ID" \
-            --arg text "[LSM自動配信] 朝の日次経済レポートが本日まだ配信されていません。GitHub Actions の schedule が発火しなかった可能性があります。手動送信: gh workflow run line-morning.yml --repo hacadr-cloud/econ-report" \
-            '{to:$to, messages:[{type:"text", text:$text}]}' > alert.json
-          code=$(curl -sS --connect-timeout 10 --max-time 30 -o aresp.json -w "%{http_code}" \
-            -X POST https://api.line.me/v2/bot/message/push \
-            -H "Authorization: Bearer $LINE_CHANNEL_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data @alert.json) || code="000"
-          cat aresp.json 2>/dev/null || true
-          if [ "$code" = "200" ]; then
-            echo "missed-delivery alert delivered to owner"
-          else
-            echo "::error::missed-delivery alert could NOT be delivered (LINE HTTP $code)"
-            exit 1
+
+          # ---- self-heal ----------------------------------------------------------------
+          # Double-sending stays impossible even if a late cron races this: line-morning's
+          # concurrency group, its already-delivered check, and LINE's X-Line-Retry-Key
+          # (same report -> same key -> 409, which it treats as success).
+          if [ "$dry" = "true" ]; then
+            echo "DRY-RUN: no delivery found since $since, so the real run WOULD now:"
+            echo "DRY-RUN:   1. gh workflow run line-morning.yml  (re-send the report to the owner)"
+            echo "DRY-RUN:   2. wait for it and verify the DELIVERED_OK receipt"
+            echo "DRY-RUN:   3. notify the owner (self-healed, or self-heal failed)"
+            echo "DRY-RUN: nothing was sent. Confirm 'Actions: write' in the Set up job log"
+            echo "DRY-RUN: above - without it, step 1 would 403 during a real outage."
+            exit 0
           fi
+          echo "no delivery since $since (JST midnight) -> self-healing via workflow_dispatch"
+          before=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run line-morning.yml --repo "$GITHUB_REPOSITORY"
+
+          # The dispatched run takes a moment to exist; poll for it rather than assume.
+          rid=""
+          for _ in $(seq 1 20); do
+            sleep 3
+            rid=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?event=workflow_dispatch&per_page=10" \
+                  | jq -r --arg t "$before" '[.workflow_runs[] | select(.created_at >= $t)] | sort_by(.created_at) | last | .id // empty')
+            [ -n "$rid" ] && break
+          done
+          if [ -z "$rid" ]; then
+            notify "[LSM自動配信] 朝の日次経済レポートが未配信のため自動再配信を試みましたが、dispatch した run が見つかりませんでした。手動送信: gh workflow run line-morning.yml --repo hacadr-cloud/econ-report" || true
+            echo "::error::dispatched run never appeared"; exit 1
+          fi
+          echo "dispatched run id=$rid; waiting for it to finish"
+          gh run watch "$rid" --repo "$GITHUB_REPOSITORY" --exit-status || true
+
+          # Verify by receipt, not by the dispatched run's conclusion - a skip is also green.
+          if was_delivered; then
+            notify "[LSM自動配信] 朝の日次経済レポートが定刻(05:33)に配信されていなかったため、watchdogが自動で再配信しました。配信は完了しています。対応は不要です。（schedule不発の可能性: gh run list --repo hacadr-cloud/econ-report --workflow line-morning.yml --event schedule）" || true
+            echo "self-heal succeeded"; exit 0
+          fi
+          notify "[LSM自動配信] 朝の日次経済レポートが未配信で、watchdogによる自動再配信も失敗しました。手動確認が必要です: gh run view $rid --repo hacadr-cloud/econ-report --log" || true
+          echo "::error::self-heal ran but no delivery receipt appeared"; exit 1

@@ -21,6 +21,14 @@ on:
 
 permissions:
   contents: read
+  actions: read     # the already-delivered check reads this workflow's own run history
+
+# Never let two sends overlap (e.g. a late cron firing while the watchdog dispatches a
+# self-heal send). This does not stop *sequential* duplicates - the already-delivered
+# check below does that.
+concurrency:
+  group: line-morning-send
+  cancel-in-progress: false
 
 jobs:
   send:
@@ -32,6 +40,7 @@ jobs:
         env:
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
@@ -59,6 +68,25 @@ jobs:
           full=$( { cat line-date.txt; cat line-latest.txt; } | sha256sum | cut -c1-32 )
           sha=${full:0:12}
           retry_key="${full:0:8}-${full:8:4}-4${full:13:3}-a${full:17:3}-${full:20:12}"
+
+          # Sequential-duplicate guard: if an earlier run today already delivered THIS exact
+          # report, do not send it again (a late cron plus the watchdog's self-heal dispatch
+          # would otherwise double-post). The retry key alone would also stop it server-side,
+          # but that is the last line of defence - do not spend it on cases we can see coming.
+          since=$(date -u -d "$today 00:00 +0900" +%Y-%m-%dT%H:%M:%SZ)
+          for rid in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/line-morning.yml/runs?per_page=30&status=success" \
+                       | jq -r --arg since "$since" '.workflow_runs[] | select(.created_at >= $since) | .id'); do
+            if [ "$rid" = "${GITHUB_RUN_ID:-}" ]; then continue; fi
+            # Grep the EXPANDED sha, never a bare "DELIVERED_OK": Actions echoes this whole
+            # run: block into the log, so the literal source line (which reads `sha=$sha`)
+            # would match in every run and make an unsent report look delivered.
+            if gh run view "$rid" --repo "$GITHUB_REPOSITORY" --log 2>/dev/null | grep -q "DELIVERED_OK sha=$sha"; then
+              echo "report sha=$sha was already delivered by run $rid; skipping duplicate send"
+              echo "NOT_DELIVERED reason=already-delivered sha=$sha"
+              exit 0
+            fi
+          done
+
           jq -Rs --arg to "$LINE_USER_ID" \
             '{to:$to, messages:[{type:"text", text:.}]}' line-latest.txt > payload.json
           code=$(curl -sS --connect-timeout 10 --max-time 60 -o resp.json -w "%{http_code}" -X POST \
