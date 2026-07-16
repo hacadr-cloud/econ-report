@@ -1,22 +1,21 @@
 name: Morning LINE econ report
 
 # The PC builds the econ report and commits line-latest.txt (+ line-date.txt) to this repo.
-# Sending is triggered externally (workflow_dispatch) -- see the note below.
+# This workflow does the actual LINE send; it is TRIGGERED by workflow_dispatch.
 #
-# SCHEDULE REMOVED 2026-07-16 (owner's call). The '33 20' (05:33 JST) cron never fired --
-# not once, and the same was true of carrier-digest's. Both times were deliberately kept
-# off the hour to dodge GitHub's top-of-hour congestion, and it made no difference. A
-# schedule that never starts cannot fail, so nothing alerts -- the exact silent
-# non-delivery this pipeline exists to prevent. Do NOT restore a schedule here expecting
-# it to work; the replacement trigger is still to be decided.
+# WHO DISPATCHES IT: the Cloudflare Worker `lsm-scheduler` (code\tools\cf-scheduler\),
+# cron 33 20 * * * UTC = 05:33 JST, calls the workflow_dispatch API. That Worker is the
+# live morning trigger and it is deployed (verified firing 2026-07-17 05:33 JST, which
+# delivered the econ report while carrier failed on the LINE monthly-quota cap).
+# report-deliver.ps1's NORMAL window ([16:00,05:00)) pushes; this send (after 05:00) is
+# what the Worker fires -- the send time and that boundary are one design, not two.
 #
-# NOTE: report-deliver.ps1's NORMAL window ([16:00,05:00)) still pushes and assumes
-# something else sends afterwards. With no cron, NORMAL currently pushes and nothing
-# sends. That gap is intentional-for-now and must be closed by whatever trigger replaces
-# this -- the send time and that boundary are one design, not two settings.
+# The vestigial GitHub `schedule:` block was removed 2026-07-16: it fired ZERO times ever
+# across both repos, and a schedule that never starts cannot fail, so nothing alerts. Do
+# NOT re-add a schedule here. 正本 = code\tools\cf-scheduler\README.md.
 
 on:
-  workflow_dispatch: {}     # the only trigger: PC-side scripts / manual runs
+  workflow_dispatch: {}     # the only trigger; the Cloudflare Worker lsm-scheduler calls it
 
 permissions:
   contents: read
