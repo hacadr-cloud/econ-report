@@ -1,7 +1,19 @@
 name: Morning LINE econ report
 
 # The PC builds the econ report and commits line-latest.txt (+ line-date.txt) to this repo.
-# This workflow does the actual LINE send; it is TRIGGERED by workflow_dispatch.
+# This workflow does a LINE send; it is TRIGGERED by workflow_dispatch.
+#
+# ★2026-08-07: THIS IS NO LONGER THE ONLY SENDER. The Cloudflare Worker lsm-scheduler now
+# sends the same report itself at 05:33 JST from a copy the PC parks with it, because GitHub
+# took the delivery down twice in three weeks - most recently on 08-07, when this very
+# workflow sat QUEUED for over two hours and never ran. Either side alone delivers.
+# Exactly one message still arrives, enforced at three levels:
+#   1. this job asks the Worker whether the same content was already delivered (fail-open),
+#   2. it scans its own recent run logs for the same sha (below),
+#   3. both senders use the SAME X-Line-Retry-Key, so LINE answers 409 to the second arrival.
+# ★The key is sha256(line-date || line-latest) over the bytes IN THIS REPO (LF). The PC's
+# working copy is CRLF (core.autocrlf=true) and hashes differently - the Worker normalises
+# to LF for exactly this reason. Change the digest here and you must change it there.
 #
 # WHO DISPATCHES IT: the Cloudflare Worker `lsm-scheduler` (code\tools\cf-scheduler\),
 # cron 33 20 * * * UTC = 05:33 JST, calls the workflow_dispatch API. That Worker is the
@@ -39,6 +51,10 @@ jobs:
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Cloudflare sends this report too (see the note above). This token lets us ask
+          # whether it already went out, and report back when we are the one who sent it.
+          INTAKE_TOKEN: ${{ secrets.LINE_INTAKE_EXPORT_TOKEN }}
+          INTAKE_BASE: https://lsm-line-intake.hacadr.workers.dev
         run: |
           set -euo pipefail
           if [ -z "${LINE_CHANNEL_TOKEN:-}" ] || [ -z "${LINE_USER_ID:-}" ]; then
@@ -66,6 +82,27 @@ jobs:
           full=$( { cat line-date.txt; cat line-latest.txt; } | sha256sum | cut -c1-32 )
           sha=${full:0:12}
           retry_key="${full:0:8}-${full:8:4}-4${full:13:3}-a${full:17:3}-${full:20:12}"
+
+          # Cross-platform duplicate guard (2026-08-07): Cloudflare sends this same report at
+          # 05:33 too. Ask its receipt table first - it is one cheap request, versus the run-log
+          # scan below which downloads whole logs.
+          # FAIL OPEN on purpose: if the Worker is unreachable we send anyway. A duplicate is
+          # still caught by the retry key (409), whereas staying silent because a *monitoring*
+          # endpoint was down would be a missed delivery caused by the safety net itself.
+          if [ -n "${INTAKE_TOKEN:-}" ]; then
+            state=$(curl -sS --connect-timeout 5 --max-time 15 \
+              -H "Authorization: Bearer $INTAKE_TOKEN" \
+              -H "User-Agent: lsm-line-morning/1.0" \
+              "$INTAKE_BASE/delivery?target=econ&sha=$sha" 2>/dev/null || echo "")
+            if [ "$(printf '%s' "$state" | jq -r '.delivered // false' 2>/dev/null || echo false)" = "true" ]; then
+              by=$(printf '%s' "$state" | jq -r '.receipt.sender // "cloudflare"' 2>/dev/null || echo cloudflare)
+              echo "report sha=$sha was already delivered by $by; skipping duplicate send"
+              echo "NOT_DELIVERED reason=already-delivered-$by sha=$sha"
+              exit 0
+            fi
+          else
+            echo "note: LINE_INTAKE_EXPORT_TOKEN not set - cannot check the Cloudflare receipt"
+          fi
 
           # Sequential-duplicate guard: if an earlier run today already delivered THIS exact
           # report, do not send it again (a late cron plus the watchdog's self-heal dispatch
@@ -101,6 +138,17 @@ jobs:
           fi
           if [ "$code" = "409" ]; then
             echo "LINE deduplicated a duplicate send (retry key already accepted)"
+          fi
+          # Tell Cloudflare we delivered it, so its 05:33 send stays quiet and the PC's
+          # liveness check can answer "was it delivered?" without reading GitHub run logs -
+          # which is exactly what it cannot do when GitHub is the thing that is down.
+          if [ -n "${INTAKE_TOKEN:-}" ]; then
+            curl -sS --connect-timeout 5 --max-time 15 -X POST "$INTAKE_BASE/delivery" \
+              -H "Authorization: Bearer $INTAKE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: lsm-line-morning/1.0" \
+              -d "{\"target\":\"econ\",\"sha\":\"$sha\",\"date\":\"$d\",\"sender\":\"github\",\"status\":$code}" \
+              >/dev/null 2>&1 || echo "warning: could not record the receipt with Cloudflare"
           fi
           # Machine-readable receipt: the watchdog must grep THIS, not the run conclusion,
           # because a skipped run is also "success".
