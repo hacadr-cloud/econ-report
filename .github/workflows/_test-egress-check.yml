@@ -1,0 +1,24 @@
+name: TEST egress check (temporary, delete after verifying)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check outbound access to various sites
+        run: |
+          set +e
+          check() {
+            local name="$1" url="$2"
+            code=$(curl -sS --connect-timeout 8 --max-time 15 -o /dev/null -w "%{http_code}" "$url")
+            echo "RESULT $name url=$url http=$code"
+          }
+          check nikkei "https://www.nikkei.com/"
+          check toyokeizai_rss "https://toyokeizai.net/list/feed/rss"
+          check nhk_rss "https://www.nhk.or.jp/rss/news/cat0.xml"
+          check google_news_rss "https://news.google.com/rss/search?q=site:jp.reuters.com+when:3d"
+          check cloudflare_worker "https://lsm-line-intake.hacadr.workers.dev/delivery?target=econ"
+          check anthropic_api "https://api.anthropic.com/v1/messages"
+          check pypi "https://pypi.org/"
